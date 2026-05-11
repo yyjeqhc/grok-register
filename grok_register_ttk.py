@@ -2449,7 +2449,7 @@ class GrokRegisterGUI:
         self.count_spinbox = tk.Spinbox(
             config_frame,
             from_=1,
-            to=100,
+            to=2500,
             width=8,
             textvariable=self.count_var,
             bg=UI_ENTRY_BG,

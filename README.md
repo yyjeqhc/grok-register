@@ -208,6 +208,17 @@ Ctrl+C
 
 CLI 模式适合长时间批量运行。程序每成功注册 5 个账号会关闭浏览器、清理运行时对象并重新启动浏览器，降低长任务内存占用。
 
+### 补扫历史账号入池
+
+如果注册流程在“写入账号文件”和“写入 grok2api”之间被 Ctrl+C 中断，可用补扫脚本重新导入历史输出文件。脚本会解析 `accounts_*.txt` 和 `accounts_*.jsonl`，默认 dry-run，不会打印 SSO token。
+
+```bash
+python scripts/reconcile_grok2api_accounts.py
+python scripts/reconcile_grok2api_accounts.py --apply
+```
+
+注册成功时仍会写旧的 `accounts_*.txt`，同时额外写一份同名 `accounts_*.jsonl`，用于避免 `----` 分隔符和密码字符冲突。
+
 ### GUI 模式
 
 ```bash

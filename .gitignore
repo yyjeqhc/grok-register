@@ -8,6 +8,7 @@ venv/
 env/
 
 accounts_*.txt
+accounts_*.jsonl
 mail_credentials.txt
 *.txt
 !requirements.txt

@@ -29,6 +29,7 @@ import urllib.parse
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
+from account_output import append_account_record
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
@@ -56,7 +57,7 @@ DEFAULT_CONFIG = {
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
-    "register_count": 1,
+    "register_count": 15,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
     "grok2api_local_token_file": "",
@@ -540,7 +541,7 @@ def _normalize_sso_token(raw_token):
     return token
 
 
-def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None, nsfw_enabled=False):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
@@ -610,7 +611,7 @@ def get_grok2api_remote_api_bases(base):
     return unique
 
 
-def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None, nsfw_enabled=False):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
@@ -692,16 +693,26 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     raise RuntimeError(f"grok2api 远端 /tokens 全量模式写入失败: {'; '.join(save_errors)}")
 
 
-def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_pools(raw_token, email="", log_callback=None, nsfw_enabled=False):
     if config.get("grok2api_auto_add_local", True):
         try:
-            add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            add_token_to_grok2api_local_pool(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                nsfw_enabled=nsfw_enabled,
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
     if config.get("grok2api_auto_add_remote", False):
         try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            add_token_to_grok2api_remote_pool(
+                raw_token,
+                email=email,
+                log_callback=log_callback,
+                nsfw_enabled=nsfw_enabled,
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
@@ -729,6 +740,12 @@ def create_browser_options(browser_proxy=""):
     options.auto_port()
     options.set_timeouts(base=1)
     apply_browser_proxy_option(options, browser_proxy)
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        options.set_argument("--no-sandbox")
+    if os.name != "nt" and not os.environ.get("DISPLAY"):
+        options.headless(True)
+    options.set_argument("--disable-dev-shm-usage")
+    options.set_argument("--disable-gpu")
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -1896,7 +1913,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         filled = page.run_js(
-            """
+            r"""
 const email = arguments[0];
 function isVisible(node) {
     if (!node) return false;
@@ -2830,7 +2847,7 @@ class GrokRegisterGUI:
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
-        self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
+        self.count_var = tk.StringVar(value=str(config.get("register_count", 15)))
         self.count_spinbox = tk.Spinbox(
             config_frame,
             from_=1,
@@ -3121,6 +3138,7 @@ class GrokRegisterGUI:
                     sso = wait_for_sso_cookie(
                         log_callback=self.log, cancel_callback=self.should_stop
                     )
+                    nsfw_ok = False
                     if config.get("enable_nsfw", True):
                         self.log("[*] 6. 开启 NSFW")
                         nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3132,12 +3150,20 @@ class GrokRegisterGUI:
                             self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
+                        append_account_record(
+                            self.accounts_output_file,
+                            email,
+                            profile.get("password", ""),
+                            sso,
+                        )
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
+                    add_token_to_grok2api_pools(
+                        sso,
+                        email=email,
+                        log_callback=self.log,
+                        nsfw_enabled=nsfw_ok,
+                    )
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3282,6 +3308,7 @@ def run_registration_cli(count):
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
+                nsfw_ok = False
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3292,12 +3319,20 @@ def run_registration_cli(count):
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
+                    append_account_record(
+                        accounts_output_file,
+                        email,
+                        profile.get("password", ""),
+                        sso,
+                    )
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                add_token_to_grok2api_pools(
+                    sso,
+                    email=email,
+                    log_callback=cli_log,
+                    nsfw_enabled=nsfw_ok,
+                )
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
@@ -3347,7 +3382,7 @@ def run_registration_cli(count):
 
 def main_cli():
     load_config()
-    count = int(config.get("register_count", 1) or 1)
+    count = int(config.get("register_count", 15) or 15)
     cli_log("[*] CLI 已加载配置")
     cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")

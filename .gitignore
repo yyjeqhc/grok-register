@@ -10,6 +10,7 @@ env/
 accounts_*.txt
 accounts_*.jsonl
 mail_credentials.txt
+cpa_auths/
 *.txt
 !requirements.txt
 

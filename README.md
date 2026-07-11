@@ -219,6 +219,33 @@ python scripts/reconcile_grok2api_accounts.py --apply
 
 注册成功时仍会写旧的 `accounts_*.txt`，同时额外写一份同名 `accounts_*.jsonl`，用于避免 `----` 分隔符和密码字符冲突。
 
+### 可选：导出 Grok 4.5 OAuth 凭据
+
+Grok 4.5 的 Grok Build/CLI 凭据与 grok.com SSO 不同。项目可在 SSO 账号保存完成后继续执行 xAI Device OAuth，并生成 CLIProxyAPI 可热加载的 `xai-<email>.json`。该功能默认关闭，OAuth 失败不会影响已经保存的 SSO 账号。
+
+先在 `config.json` 中启用单账号验证：
+
+```json
+{
+  "cpa_export_enabled": true,
+  "cpa_auth_dir": "./cpa_auths",
+  "cpa_copy_to_hotload": false,
+  "cpa_hotload_dir": "",
+  "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+  "cpa_proxy": "",
+  "cpa_headless": false,
+  "cpa_probe_after_write": true
+}
+```
+
+OAuth 同意流程建议在有图形桌面的环境运行。确认 `cpa_auths/xai-*.json` 生成且 probe 成功后，再把文件以 `0600` 权限导入 CLIProxyAPI 的 auth-dir。历史账号可以补认证：
+
+```bash
+python scripts/backfill_cpa_xai_from_accounts.py --limit 1
+```
+
+OAuth JSON 含 refresh token，已被 `.gitignore` 忽略，仍应限制目录读取权限。现有 grok2api SSO 池与 CPA OAuth 池彼此独立。
+
 ### GUI 模式
 
 ```bash

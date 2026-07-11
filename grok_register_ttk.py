@@ -65,6 +65,20 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "cpa_export_enabled": False,
+    "cpa_auth_dir": "./cpa_auths",
+    "cpa_copy_to_hotload": False,
+    "cpa_hotload_dir": "",
+    "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+    "cpa_proxy": "",
+    "cpa_headless": False,
+    "cpa_force_standalone": True,
+    "cpa_mint_timeout_sec": 300,
+    "cpa_probe_after_write": True,
+    "cpa_probe_chat": False,
+    "cpa_mint_cookie_inject": True,
+    "cpa_mint_browser_reuse": True,
+    "cpa_mint_browser_recycle_every": 15,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -716,6 +730,49 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None, nsfw_ena
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+
+
+def export_cpa_xai_for_registered_account(
+    email,
+    password,
+    sso,
+    *,
+    target_page=None,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """Optionally mint a refreshable xAI OAuth credential for Grok 4.5.
+
+    SSO persistence is the source-of-truth registration result. CPA export is
+    deliberately best-effort so an OAuth/consent failure never causes the
+    already-created account to be registered again.
+    """
+    if not config.get("cpa_export_enabled", False):
+        return {"ok": False, "skipped": True, "reason": "disabled"}
+    log = log_callback or (lambda _message: None)
+    try:
+        from cpa_export import export_cpa_xai_for_account
+    except Exception as exc:
+        log(f"[Debug] CPA/OIDC 模块加载失败: {exc}")
+        return {"ok": False, "error": f"import: {exc}"}
+    try:
+        result = export_cpa_xai_for_account(
+            email,
+            password,
+            page=target_page,
+            sso=sso,
+            config=config,
+            log_callback=log,
+            cancel_callback=cancel_callback,
+        )
+    except Exception as exc:
+        log(f"[!] CPA/OIDC 导出失败，SSO 账号仍已保存: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if result.get("ok"):
+        log(f"[+] CPA/OIDC 导出成功: {result.get('path')}")
+    elif not result.get("skipped"):
+        log(f"[!] CPA/OIDC 导出失败，SSO 账号仍已保存: {result.get('error') or 'unknown'}")
+    return result
 
 
 def apply_browser_proxy_option(options, proxy):
@@ -3164,6 +3221,14 @@ class GrokRegisterGUI:
                         log_callback=self.log,
                         nsfw_enabled=nsfw_ok,
                     )
+                    export_cpa_xai_for_registered_account(
+                        email,
+                        profile.get("password", ""),
+                        sso,
+                        target_page=page,
+                        log_callback=self.log,
+                        cancel_callback=self.should_stop,
+                    )
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3332,6 +3397,14 @@ def run_registration_cli(count):
                     email=email,
                     log_callback=cli_log,
                     nsfw_enabled=nsfw_ok,
+                )
+                export_cpa_xai_for_registered_account(
+                    email,
+                    profile.get("password", ""),
+                    sso,
+                    target_page=page,
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
                 )
                 success_count += 1
                 retry_count_for_slot = 0

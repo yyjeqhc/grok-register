@@ -520,6 +520,116 @@ def _click_exact(
     return None
 
 
+def _fill(
+    page: Any,
+    selector: str,
+    value: str,
+    log: LogFn,
+    label: str = "field",
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Fill an input by CSS/selector. Returns True when the value sticks.
+
+    Used by email/password device-auth login. Missing fields are soft-fail so
+    password-only pages (email already filled or hidden) do not abort mint.
+    """
+    value = "" if value is None else str(value)
+    if page is None:
+        log(f"fill {label}: page is None")
+        return False
+    if not value:
+        log(f"fill {label}: empty value, skip")
+        return False
+
+    el = None
+    try:
+        el = page.ele(selector, timeout=timeout)
+    except Exception as e:
+        log(f"fill {label}: lookup failed {selector!r}: {e}")
+        return False
+    if el is None:
+        log(f"fill {label}: not found {selector!r}")
+        return False
+
+    try:
+        el.scroll.to_see()
+    except Exception:
+        pass
+
+    css = selector[4:] if selector.startswith("css:") else selector
+    want = value.strip()
+
+    def _read_value() -> str:
+        try:
+            current = (el.attr("value") or getattr(el, "value", None) or "").strip()
+            if current:
+                return current
+        except Exception:
+            pass
+        try:
+            prop = page.run_js(
+                "const n=document.querySelector(arguments[0]); return n ? (n.value||'') : '';",
+                css,
+            )
+            if isinstance(prop, str):
+                return prop.strip()
+        except Exception:
+            pass
+        return ""
+
+    # Prefer real keyboard input (React-controlled forms); fall back to JS setter.
+    for mode, kwargs in (
+        ("input", {"clear": True, "by_js": False}),
+        ("input-js", {"clear": True, "by_js": True}),
+    ):
+        try:
+            el.input(value, **kwargs)
+            current = _read_value()
+            if current == want:
+                log(f"fill {label}: ok via {mode}")
+                return True
+            # Password inputs often hide value from readers after a successful type.
+            if label in ("password", "pass") and mode == "input":
+                log(f"fill {label}: ok via {mode} (opaque password field)")
+                return True
+            log(f"fill {label}: {mode} wrote {current!r}, expected {want[:32]!r}")
+        except Exception as e:
+            log(f"fill {label}: {mode} failed: {e}")
+
+    # Last resort: native value setter + input/change events (mirrors register fill)
+    try:
+        ok = page.run_js(
+            """
+const sel = arguments[0];
+const val = arguments[1];
+const input = document.querySelector(sel);
+if (!input) return false;
+input.focus();
+try { input.click(); } catch (e) {}
+const proto = input instanceof HTMLTextAreaElement
+  ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+const tracker = input._valueTracker;
+if (tracker) tracker.setValue('');
+if (desc && desc.set) desc.set.call(input, val); else input.value = val;
+input.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, data:val, inputType:'insertText'}));
+input.dispatchEvent(new InputEvent('input', {bubbles:true, data:val, inputType:'insertText'}));
+input.dispatchEvent(new Event('change', {bubbles:true}));
+return (input.value || '') === val;
+            """,
+            css,
+            value,
+        )
+        if ok:
+            log(f"fill {label}: ok via js-setter")
+            return True
+        log(f"fill {label}: js-setter returned {ok!r}")
+    except Exception as e:
+        log(f"fill {label}: js-setter failed: {e}")
+    return False
+
+
 def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
     """Wait/click Cloudflare Turnstile on the mint browser page."""
     deadline = time.time() + timeout

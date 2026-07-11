@@ -269,21 +269,22 @@ def normalize_cookies(cookies: Any) -> list[dict[str, Any]]:
 
 
 def inject_cookies(page: Any, cookies: Any, log: LogFn | None = None) -> int:
-    """Inject cookies into page/browser. Returns count attempted."""
+    """Inject cookies into page/browser. Returns count attempted.
+
+    Fast path: warm only accounts.x.ai (device-auth host). Multi-site crawls
+    used to add multi-second latency with little benefit for SSO cookie clones.
+    """
     log = log or _noop_log
     items = normalize_cookies(cookies)
     if not items or page is None:
         return 0
-    for url in (
-        "https://accounts.x.ai/",
-        "https://auth.x.ai/",
-        "https://grok.com/",
-    ):
-        try:
-            page.get(url)
-            _sleep(0.4)
-        except Exception:
-            continue
+
+    # One origin is enough for set.cookies with explicit Domain attributes.
+    try:
+        page.get("https://accounts.x.ai/")
+        _sleep(0.2)
+    except Exception as e:
+        log(f"cookie warm accounts.x.ai failed: {e}")
 
     n = 0
     for target_name, target in (("page", page), ("browser", getattr(page, "browser", None))):
@@ -313,7 +314,7 @@ def inject_cookies(page: Any, cookies: Any, log: LogFn | None = None) -> int:
                 n += 1
         log(f"injected cookies one-by-one={n}/{len(items)}")
 
-    # JS document.cookie for non-httpOnly SSO cookies (best effort)
+    # JS document.cookie for non-httpOnly SSO cookies (best effort; already on accounts.x.ai)
     try:
         js_items = [
             c
@@ -321,11 +322,9 @@ def inject_cookies(page: Any, cookies: Any, log: LogFn | None = None) -> int:
             if (not c.get("httpOnly")) and c.get("name") in {"sso", "sso-rw", "cf_clearance"}
         ]
         if js_items:
-            page.get("https://accounts.x.ai/")
             for c in js_items:
                 name = str(c["name"])
                 val = str(c["value"])
-                # avoid quote breakage
                 if "'" in name or "'" in val:
                     continue
                 page.run_js(
@@ -630,14 +629,66 @@ return (input.value || '') === val;
     return False
 
 
-def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
-    """Wait/click Cloudflare Turnstile on the mint browser page."""
+def _turnstile_widget_present(page: Any) -> bool:
+    """Cheap probe: is a Turnstile widget (or response input) on the page?"""
+    try:
+        el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.15)
+        if el is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        el = page.ele("@name=cf-turnstile-response", timeout=0.1)
+        if el is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        iframe = page.ele(
+            "css:iframe[src*='turnstile'], iframe[src*='challenges.cloudflare']",
+            timeout=0.15,
+        )
+        if iframe is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        hit = page.run_js(
+            """
+const nodes = Array.from(document.querySelectorAll('iframe,div,span'));
+return nodes.some((n) => {
+  const txt = ((n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '')).toLowerCase();
+  return txt.includes('turnstile') || txt.includes('cf-turnstile');
+});
+            """
+        )
+        return bool(hit)
+    except Exception:
+        return False
+
+
+def _wait_turnstile(
+    page: Any,
+    log: LogFn,
+    timeout: float = 45.0,
+    *,
+    absent_ok_after: float = 2.0,
+) -> bool:
+    """Wait/click Cloudflare Turnstile on the mint browser page.
+
+    If no widget appears within ``absent_ok_after`` seconds, return True
+    immediately (nothing to wait for). Previously a missing widget burned the
+    full timeout (25s+12s on login) and dominated mint latency.
+    """
     deadline = time.time() + timeout
+    started = time.time()
     clicked = False
+    saw_widget = False
     while time.time() < deadline:
         try:
-            el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.3)
+            el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.2)
             if el is not None:
+                saw_widget = True
                 v = (el.attr("value") or "").strip()
                 if len(v) > 20:
                     log(f"turnstile ready len={len(v)}")
@@ -645,10 +696,19 @@ def _wait_turnstile(page: Any, log: LogFn, timeout: float = 45.0) -> bool:
         except Exception:
             pass
 
+        if not saw_widget and _turnstile_widget_present(page):
+            saw_widget = True
+
+        # No widget at all → don't sit for the full timeout.
+        if not saw_widget and (time.time() - started) >= absent_ok_after:
+            log(f"turnstile absent after {absent_ok_after:.1f}s — skip wait")
+            return True
+
         # Mimic register-machine: shadow-root checkbox click
         try:
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
+            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.15)
             if challenge_input is not None:
+                saw_widget = True
                 wrapper = challenge_input.parent()
                 iframe = None
                 try:
@@ -682,7 +742,7 @@ Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
         except Exception:
             pass
 
-        if not clicked:
+        if saw_widget and not clicked:
             try:
                 page.run_js(
                     """
@@ -697,7 +757,7 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
                 log("clicked turnstile container via JS")
             except Exception:
                 pass
-        _sleep(0.9)
+        _sleep(0.45 if saw_widget else 0.25)
     log("turnstile not ready")
     return False
 
@@ -732,7 +792,7 @@ def approve_device_code(
         page.get(verification_uri_complete, timeout=60)
     except TypeError:
         page.get(verification_uri_complete)
-    _sleep(2.0)
+    _sleep(0.6)
 
     deadline = time.time() + timeout_sec
     phase = "device"
@@ -753,16 +813,21 @@ def approve_device_code(
             if snip:
                 log(f"visible: {snip}")
 
-        # Done page
+        # Done page — leave ASAP so token poll thread can finish without us blocking
         if "device/done" in url or "设备已授权" in text or "device authorized" in text.lower():
             log("device done page — waiting for token poll")
-            _sleep(1.5)
+            # Short spins until poll sets stop_event instead of fixed 1.5s sleeps
+            for _ in range(40):
+                if stop_event is not None and stop_event.is_set():
+                    log("stop_event set — leave after device done")
+                    return
+                _sleep(0.25)
             continue
 
         if "Invalid action" in text:
             log("Invalid action — reopen device uri")
             page.get(verification_uri_complete)
-            _sleep(2.0)
+            _sleep(1.0)
             phase = "device"
             continue
 
@@ -771,7 +836,7 @@ def approve_device_code(
             phase = "consent"
             # Prefer real click; React needs it to set form action=allow
             if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], log, real=True):
-                _sleep(2.5)
+                _sleep(0.9)
                 continue
             # last resort: set action and submit
             try:
@@ -787,13 +852,13 @@ def approve_device_code(
                     """
                 )
                 log("consent form submit via JS fallback")
-                _sleep(2.5)
+                _sleep(0.9)
             except Exception as e:
                 log(f"consent fallback failed: {e}")
             continue
 
         # Device code entry
-        if page.ele("css:input[name='user_code']", timeout=0.3) and "consent" not in url:
+        if page.ele("css:input[name='user_code']", timeout=0.25) and "consent" not in url:
             phase = "device"
             if user_code:
                 try:
@@ -806,14 +871,14 @@ def approve_device_code(
                 except Exception:
                     pass
             if _click_exact(page, ["继续", "Continue"], log, real=False):
-                _sleep(2.0)
+                _sleep(0.7)
                 continue
             try:
-                el = page.ele("css:button[type='submit']", timeout=0.5)
+                el = page.ele("css:button[type='submit']", timeout=0.4)
                 if el:
                     el.click(by_js=True)
                     log("clicked device submit")
-                    _sleep(2.0)
+                    _sleep(0.7)
                     continue
             except Exception:
                 pass
@@ -821,66 +886,66 @@ def approve_device_code(
         # Account redirect
         if "正在重定向" in text or ("/account" in url and "sign-in" not in url):
             if _click_exact(page, ["继续", "Continue"], log, real=False):
-                _sleep(2.0)
+                _sleep(0.7)
                 continue
 
         # Cookie banner (exact labels only)
         if "全部允许" in text or "隐私偏好" in text:
             _click_exact(page, ["全部允许", "全部拒绝"], log, real=False)
-            _sleep(0.5)
+            _sleep(0.3)
 
         # Sign-in chooser
         if "使用邮箱登录" in text or "Continue with email" in text:
             if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email"], log, real=False):
-                _sleep(1.5)
+                _sleep(0.6)
                 phase = "email"
                 continue
 
         # Email only step
-        if page.ele("css:input[type='email']", timeout=0.3) and not page.ele(
-            "css:input[type='password']", timeout=0.2
+        if page.ele("css:input[type='email']", timeout=0.25) and not page.ele(
+            "css:input[type='password']", timeout=0.15
         ):
             phase = "email"
             _fill(page, "css:input[type='email']", email, log, "email")
             if _click_exact(page, ["下一步", "Next", "Continue", "继续"], log, real=False):
-                _sleep(1.8)
+                _sleep(0.7)
                 continue
 
         # Password login
-        if page.ele("css:input[type='password']", timeout=0.3):
+        if page.ele("css:input[type='password']", timeout=0.25):
             phase = "password"
             if login_attempts >= 5:
-                _sleep(1.0)
+                _sleep(0.6)
                 continue
             login_attempts += 1
             log(f"login attempt {login_attempts}")
             _fill(page, "css:input[type='email']", email, log, "email")
-            _wait_turnstile(page, log, 25)
             _fill(page, "css:input[type='password']", password, log, "password")
-            _wait_turnstile(page, log, 12)
+            # Single turnstile wait after both fields (skip full timeout if absent)
+            _wait_turnstile(page, log, 18.0, absent_ok_after=2.0)
             # REAL click login helps form submit
             if not _click_exact(page, ["登录", "Sign in", "Log in"], log, real=True):
                 try:
-                    el = page.ele("css:button[type='submit']", timeout=0.5) or page.ele(
-                        "css:button[data-testid='sign-in-submit']", timeout=0.5
+                    el = page.ele("css:button[type='submit']", timeout=0.4) or page.ele(
+                        "css:button[data-testid='sign-in-submit']", timeout=0.4
                     )
                     if el:
                         el.click()
                         log("clicked login submit real")
                 except Exception as e:
                     log(f"login submit fail: {e}")
-            # wait navigation
-            for _ in range(24):
+            # wait navigation (cap ~6s)
+            for _ in range(20):
                 if stop_event is not None and stop_event.is_set():
                     return
-                _sleep(0.5)
-                if not page.ele("css:input[type='password']", timeout=0.2):
+                _sleep(0.3)
+                if not page.ele("css:input[type='password']", timeout=0.15):
                     break
                 if "sign-in" not in _page_url(page):
                     break
             continue
 
-        _sleep(1.0)
+        _sleep(0.35)
 
     if stop_event is not None and stop_event.is_set():
         log("browser finished via stop_event")
@@ -920,23 +985,25 @@ def mint_with_browser(
     set_runtime_proxy(resolved or None)
     success = False
     try:
-        last_err: BaseException | None = None
-        sess = None
-        for attempt in range(1, 4):
-            try:
-                sess = request_device_code(proxy=resolved or None)
-                last_err = None
-                break
-            except BaseException as e:  # noqa: BLE001
-                last_err = e
-                log(f"request_device_code attempt {attempt}/3 failed: {e}")
-                _sleep(1.5 * attempt)
-        if sess is None:
-            raise last_err or RuntimeError("request_device_code failed")
-        log(
-            f"device user_code={sess.user_code} expires_in={sess.expires_in} "
-            f"proxy={proxy_log_label(resolved) or '(none)'}"
-        )
+        # Overlap device-code HTTP with browser startup + cookie inject.
+        sess_box: dict[str, Any] = {}
+        sess_err: dict[str, BaseException] = {}
+
+        def _request_sess() -> None:
+            last_err: BaseException | None = None
+            for attempt in range(1, 4):
+                try:
+                    sess_box["sess"] = request_device_code(proxy=resolved or None)
+                    return
+                except BaseException as e:  # noqa: BLE001
+                    last_err = e
+                    log(f"request_device_code attempt {attempt}/3 failed: {e}")
+                    _sleep(1.0 * attempt)
+            if last_err is not None:
+                sess_err["err"] = last_err
+
+        t_sess = threading.Thread(target=_request_sess, name="oauth-device-code", daemon=True)
+        t_sess.start()
 
         if work_page is None:
             own_browser, work_page, owned = acquire_mint_browser(
@@ -946,17 +1013,13 @@ def mint_with_browser(
                 recycle_every=recycle_every,
                 log=log,
             )
-            if owned:
-                # non-reuse path: track for finally close
-                pass
 
         # Cookie inject before opening device URL (skip secondary login when possible)
         if cookies:
             n = inject_cookies(work_page, cookies, log=log)
             log(f"cookie inject count={n}")
+            # inject_cookies already landed on accounts.x.ai — light session check only
             try:
-                work_page.get("https://accounts.x.ai/")
-                _sleep(1.0)
                 url = _page_url(work_page)
                 text = _visible_text(work_page)
                 snip = _norm(text)[:120]
@@ -964,16 +1027,26 @@ def mint_with_browser(
             except Exception as e:
                 log(f"post-inject check: {e}")
 
+        t_sess.join(timeout=90)
+        if "sess" not in sess_box:
+            raise sess_err.get("err") or RuntimeError("request_device_code failed")
+        sess = sess_box["sess"]
+        log(
+            f"device user_code={sess.user_code} expires_in={sess.expires_in} "
+            f"proxy={proxy_log_label(resolved) or '(none)'}"
+        )
+
         stop_event = threading.Event()
         token_box: dict[str, Any] = {}
         err_box: dict[str, BaseException] = {}
 
         def _poll() -> None:
             try:
-                time.sleep(2)
+                # Poll immediately; authorization_pending is expected until consent.
+                # Respect server interval but do not force a 5s floor.
                 tr = poll_device_token(
                     sess.device_code,
-                    interval=max(sess.interval, 5),
+                    interval=max(int(sess.interval or 5), 2),
                     expires_in=min(sess.expires_in, int(browser_timeout_sec) + 60),
                     log=log,
                     cancel=cancel,

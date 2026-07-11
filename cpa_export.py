@@ -137,8 +137,9 @@ def export_cpa_xai_for_account(
                     break
         if sso_val:
             base = list(use_cookies) if isinstance(use_cookies, list) else []
+            # Device-auth hosts only — skip grok.com clones (unused, bloated set.cookies).
             for name in ("sso", "sso-rw"):
-                for dom in (".x.ai", "accounts.x.ai", ".accounts.x.ai", "auth.x.ai", "grok.com", ".grok.com"):
+                for dom in (".x.ai", "accounts.x.ai", ".accounts.x.ai", "auth.x.ai", ".auth.x.ai"):
                     base.append({
                         "name": name,
                         "value": sso_val,

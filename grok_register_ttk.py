@@ -85,6 +85,8 @@ DEFAULT_CONFIG = {
     "cpa_mint_browser_reuse": True,
     "cpa_mint_browser_recycle_every": 15,
     "yescaptcha_api_key": "",
+    # Hotmail / Outlook OAuth pool: email----password----client_id----refresh_token
+    "hotmail_tokens_file": "./hotmail/alive_sample7.txt",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1226,6 +1228,10 @@ def get_email_provider():
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if provider == "hotmail":
+        import hotmail_mail
+
+        return hotmail_mail.get_email_and_token(config=config, log_callback=None)
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -1268,6 +1274,23 @@ def get_email_and_token(api_key=None):
     return address, token
 
 
+def hotmail_mark_registration_result(email, *, success: bool, log_callback=None):
+    """Consume hotmail card on success; return to pool on mail/registration failure."""
+    if get_email_provider() != "hotmail" or not email:
+        return
+    try:
+        import hotmail_mail
+
+        log = log_callback or (lambda _m: None)
+        if success:
+            hotmail_mail.mark_used(email, config=config, log=log)
+        else:
+            hotmail_mail.release_account(email, reason="retry", config=config, log=log)
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[hotmail] 池状态更新失败: {exc}")
+
+
 def get_oai_code(
     dev_token,
     email,
@@ -1278,6 +1301,19 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if provider == "hotmail":
+        import hotmail_mail
+
+        # IMAP poll; resend_callback is UI-side, still useful for xAI page
+        return hotmail_mail.get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=max(poll_interval, 4),
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            config=config,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1973,11 +2009,19 @@ return !!(givenInput && familyInput && passwordInput);
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
-    email, dev_token = get_email_and_token()
+    if get_email_provider() == "hotmail":
+        import hotmail_mail
+
+        email, dev_token = hotmail_mail.get_email_and_token(
+            config=config, log_callback=log_callback
+        )
+    else:
+        email, dev_token = get_email_and_token()
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:
-        log_callback(f"[*] 已创建邮箱: {email}")
+        kind = "Hotmail 领取" if get_email_provider() == "hotmail" else "已创建邮箱"
+        log_callback(f"[*] {kind}: {email}")
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
@@ -2915,7 +2959,12 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(
+            config_frame,
+            self.email_provider_var,
+            ["duckmail", "yyds", "cloudflare", "hotmail"],
+            width=12,
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -3113,6 +3162,19 @@ class GrokRegisterGUI:
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
             return
+        if config["email_provider"] == "hotmail":
+            try:
+                import hotmail_mail
+
+                n = hotmail_mail.pool_count(config)
+                tokens = hotmail_mail.resolve_tokens_file(config)
+                if n <= 0:
+                    self.log(f"[!] Hotmail 池为空: {tokens}")
+                    return
+                self.log(f"[*] Hotmail 池: {n} 个 @ {tokens}")
+            except Exception as exc:
+                self.log(f"[!] Hotmail 池检查失败: {exc}")
+                return
         try:
             count = int(self.count_var.get())
         except Exception:
@@ -3191,6 +3253,9 @@ class GrokRegisterGUI:
                             break
                         except Exception as mail_exc:
                             msg = str(mail_exc)
+                            hotmail_mark_registration_result(
+                                email, success=False, log_callback=self.log
+                            )
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                                 restart_browser(log_callback=self.log)
@@ -3244,6 +3309,9 @@ class GrokRegisterGUI:
                         log_callback=self.log,
                         cancel_callback=self.should_stop,
                     )
+                    hotmail_mark_registration_result(
+                        email, success=True, log_callback=self.log
+                    )
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3259,8 +3327,14 @@ class GrokRegisterGUI:
                         )
                 except RegistrationCancelled:
                     self.log("[!] 注册被用户停止")
+                    hotmail_mark_registration_result(
+                        email, success=False, log_callback=self.log
+                    )
                     break
                 except AccountRetryNeeded as exc:
+                    hotmail_mark_registration_result(
+                        email, success=False, log_callback=self.log
+                    )
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         self.log(
@@ -3274,6 +3348,9 @@ class GrokRegisterGUI:
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    hotmail_mark_registration_result(
+                        email, success=False, log_callback=self.log
+                    )
                     self.fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3369,6 +3446,9 @@ def run_registration_cli(count):
                         break
                     except Exception as mail_exc:
                         msg = str(mail_exc)
+                        hotmail_mark_registration_result(
+                            email, success=False, log_callback=cli_log
+                        )
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                             cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                             restart_browser(log_callback=cli_log)
@@ -3421,6 +3501,9 @@ def run_registration_cli(count):
                     log_callback=cli_log,
                     cancel_callback=controller.should_stop,
                 )
+                hotmail_mark_registration_result(
+                    email, success=True, log_callback=cli_log
+                )
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
@@ -3433,8 +3516,14 @@ def run_registration_cli(count):
                     )
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
+                hotmail_mark_registration_result(
+                    email, success=False, log_callback=cli_log
+                )
                 break
             except AccountRetryNeeded as exc:
+                hotmail_mark_registration_result(
+                    email, success=False, log_callback=cli_log
+                )
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -3446,6 +3535,9 @@ def run_registration_cli(count):
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
+                hotmail_mark_registration_result(
+                    email, success=False, log_callback=cli_log
+                )
                 fail_count += 1
                 retry_count_for_slot = 0
                 i += 1

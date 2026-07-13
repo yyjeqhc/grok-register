@@ -23,3 +23,8 @@ config.local.json
 .vscode/
 DrissionPage/
 autoPortData/
+
+
+# hotmail OAuth pools (secrets)
+hotmail/*.txt
+!hotmail/README.txt

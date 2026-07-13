@@ -393,31 +393,70 @@ def extract_xai_code(text: str, subject: str = "") -> str | None:
     return None
 
 
+def inbox_has_prior_xai_mail(acc: HotmailAccount, *, lookback_limit: int = 25) -> list[dict[str, Any]]:
+    """Return recent xAI-related messages if this mailbox was already used for xAI."""
+    try:
+        messages = imap_fetch_recent(acc, limit=lookback_limit)
+    except Exception:
+        return []
+    hits: list[dict[str, Any]] = []
+    for msg in messages:
+        blob = f"{msg.get('subject') or ''} {msg.get('from') or ''} {msg.get('body') or ''}".lower()
+        subj = str(msg.get("subject") or "")
+        if (
+            "x.ai" in blob
+            or "noreply@x.ai" in blob
+            or "xai confirmation" in blob
+            or re.search(r"\b[A-Z0-9]{3}-[A-Z0-9]{3}\b", subj, re.I)
+            and "xai" in subj.lower()
+        ):
+            hits.append(msg)
+    return hits
+
+
 def get_email_and_token(
     config: dict | None = None,
     log_callback: Callable[[str], None] | None = None,
     *,
-    max_refresh_attempts: int = 8,
+    max_refresh_attempts: int = 12,
 ) -> tuple[str, str]:
     """Claim pool account. Returns (email, dev_token) where dev_token is hotmail:<email>.
 
-    Skips cards whose refresh_token is already dead (invalid_grant), up to
-    *max_refresh_attempts* tries.
+    Skips:
+      - dead refresh tokens (invalid_grant)
+      - mailboxes that already contain xAI verification mail (burned by others)
+        when config hotmail_skip_if_xai_mail is true (default).
     """
     log = log_callback or (lambda _m: None)
+    cfg = config or {}
+    skip_xai = bool(cfg.get("hotmail_skip_if_xai_mail", True))
     last_err: Exception | None = None
     for attempt in range(1, max_refresh_attempts + 1):
         acc = claim_account(config, log=log)
         try:
             refresh_access_token(acc, force=True)
-            return acc.email, f"hotmail:{acc.login_hint}"
         except Exception as e:  # noqa: BLE001
             last_err = e
             log(f"[hotmail] refresh failed ({attempt}/{max_refresh_attempts}), mark dead: {e}")
             mark_dead(acc.email, config=config, log=log)
             continue
+
+        if skip_xai:
+            hits = inbox_has_prior_xai_mail(acc)
+            if hits:
+                sample = (hits[0].get("subject") or "")[:60]
+                log(
+                    f"[hotmail] 收件箱已有 xAI 邮件({len(hits)}), 判定被占用, 跳过: "
+                    f"{acc.email} e.g. {sample!r}"
+                )
+                # burned = already used for xAI by someone else; do not return to pool
+                release_account(acc.email, reason="burned", config=config, log=log)
+                last_err = RuntimeError(f"prior xAI mail: {sample}")
+                continue
+
+        return acc.email, f"hotmail:{acc.login_hint}"
     raise RuntimeError(
-        f"Hotmail 连续 {max_refresh_attempts} 个 token 无效: {last_err}"
+        f"Hotmail 连续 {max_refresh_attempts} 个不可用 (dead/burned): {last_err}"
     )
 
 

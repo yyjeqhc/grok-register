@@ -87,6 +87,8 @@ DEFAULT_CONFIG = {
     "yescaptcha_api_key": "",
     # Hotmail / Outlook OAuth pool: email----password----client_id----refresh_token
     "hotmail_tokens_file": "./hotmail/alive_sample7.txt",
+    # Skip hotmail cards whose inbox already has xAI verification mail (burned).
+    "hotmail_skip_if_xai_mail": True,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -98,6 +100,12 @@ class RegistrationCancelled(Exception):
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class EmailAlreadyRegistered(Exception):
+    """Signup email is already bound to an xAI account (common for burned hotmail)."""
+
     pass
 
 
@@ -1274,8 +1282,10 @@ def get_email_and_token(api_key=None):
     return address, token
 
 
-def hotmail_mark_registration_result(email, *, success: bool, log_callback=None):
-    """Consume hotmail card on success; return to pool on mail/registration failure."""
+def hotmail_mark_registration_result(
+    email, *, success: bool, log_callback=None, burned: bool = False
+):
+    """Consume hotmail card on success; return to pool on failure; burned = already used."""
     if get_email_provider() != "hotmail" or not email:
         return
     try:
@@ -1284,6 +1294,8 @@ def hotmail_mark_registration_result(email, *, success: bool, log_callback=None)
         log = log_callback or (lambda _m: None)
         if success:
             hotmail_mail.mark_used(email, config=config, log=log)
+        elif burned:
+            hotmail_mail.release_account(email, reason="burned", config=config, log=log)
         else:
             hotmail_mail.release_account(email, reason="retry", config=config, log=log)
     except Exception as exc:
@@ -2765,6 +2777,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
+    login_hint_since = None
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2773,6 +2786,39 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
+
+            # 邮箱已被占用时，页面常停在「您正在登录 / 返回」而不是完成注册
+            try:
+                login_probe = page.run_js(
+                    r"""
+const url = String(location.href || '');
+const body = (document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim();
+const low = body.toLowerCase();
+const hit =
+  body.includes('您正在登录') ||
+  body.includes('已经注册') ||
+  body.includes('已有账户') ||
+  low.includes('already have an account') ||
+  low.includes('you are signing in') ||
+  (url.includes('/sign-in') && !url.includes('sign-up'));
+if (!hit) return '';
+return (url + ' | ' + body).slice(0, 180);
+                    """
+                )
+            except Exception:
+                login_probe = ""
+            if login_probe:
+                now_lp = time.time()
+                if login_hint_since is None:
+                    login_hint_since = now_lp
+                    if log_callback:
+                        log_callback(f"[!] 页面疑似登录/邮箱已注册: {login_probe}")
+                elif now_lp - login_hint_since >= 8:
+                    raise EmailAlreadyRegistered(
+                        f"邮箱可能已被注册，页面停留在登录态: {login_probe}"
+                    )
+            else:
+                login_hint_since = None
 
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
@@ -2889,7 +2935,7 @@ return String(cfInput.value || '').trim().length;
                     return value
         except PageDisconnectedError:
             refresh_active_page()
-        except AccountRetryNeeded:
+        except (AccountRetryNeeded, EmailAlreadyRegistered, RegistrationCancelled):
             raise
         except Exception:
             pass
@@ -3331,6 +3377,14 @@ class GrokRegisterGUI:
                         email, success=False, log_callback=self.log
                     )
                     break
+                except EmailAlreadyRegistered as exc:
+                    hotmail_mark_registration_result(
+                        email, success=False, burned=True, log_callback=self.log
+                    )
+                    self.fail_count += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    self.log(f"[-] 邮箱已占用/已注册，换号: {exc}")
                 except AccountRetryNeeded as exc:
                     hotmail_mark_registration_result(
                         email, success=False, log_callback=self.log
@@ -3520,6 +3574,14 @@ def run_registration_cli(count):
                     email, success=False, log_callback=cli_log
                 )
                 break
+            except EmailAlreadyRegistered as exc:
+                hotmail_mark_registration_result(
+                    email, success=False, burned=True, log_callback=cli_log
+                )
+                fail_count += 1
+                retry_count_for_slot = 0
+                i += 1
+                cli_log(f"[-] 邮箱已占用/已注册，换号: {exc}")
             except AccountRetryNeeded as exc:
                 hotmail_mark_registration_result(
                     email, success=False, log_callback=cli_log

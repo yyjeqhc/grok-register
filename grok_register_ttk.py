@@ -75,10 +75,16 @@ DEFAULT_CONFIG = {
     "cpa_force_standalone": True,
     "cpa_mint_timeout_sec": 300,
     "cpa_probe_after_write": True,
-    "cpa_probe_chat": False,
+    # Strong welfare: chat probe is the live-pool gate (mint-only is not enough).
+    "cpa_probe_chat": True,
+    "cpa_require_chat": True,
+    # sso_first | sso_only | device_only — SSO protocol mint is faster (no 2nd browser).
+    "cpa_mint_mode": "sso_first",
+    "cpa_device_fallback": True,
     "cpa_mint_cookie_inject": True,
     "cpa_mint_browser_reuse": True,
     "cpa_mint_browser_recycle_every": 15,
+    "yescaptcha_api_key": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -769,7 +775,16 @@ def export_cpa_xai_for_registered_account(
         log(f"[!] CPA/OIDC 导出失败，SSO 账号仍已保存: {exc}")
         return {"ok": False, "error": str(exc)}
     if result.get("ok"):
-        log(f"[+] CPA/OIDC 导出成功: {result.get('path')}")
+        log(
+            f"[+] CPA/OIDC 导出成功 method={result.get('method')} "
+            f"chat={result.get('chat_ok')} path={result.get('path')}"
+        )
+    elif result.get("mint_ok") and not result.get("chat_ok"):
+        log(
+            f"[!] CPA mint 成功但 chat 不可用（强福利不进 live） "
+            f"method={result.get('method')} path={result.get('path')} "
+            f"err={result.get('error') or 'chat failed'}"
+        )
     elif not result.get("skipped"):
         log(f"[!] CPA/OIDC 导出失败，SSO 账号仍已保存: {result.get('error') or 'unknown'}")
     return result

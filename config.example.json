@@ -40,7 +40,7 @@
 
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
-  "hotmail_tokens_file": "./hotmail/alive_sample7.txt",
+  "hotmail_tokens_file": "./hotmail/tokens.txt",
   "hotmail_skip_if_xai_mail": true,
   "yyds_api_key": "",
   "yyds_jwt": ""

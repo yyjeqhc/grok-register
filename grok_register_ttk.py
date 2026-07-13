@@ -85,9 +85,9 @@ DEFAULT_CONFIG = {
     "cpa_mint_browser_reuse": True,
     "cpa_mint_browser_recycle_every": 15,
     "yescaptcha_api_key": "",
-    # Hotmail / Outlook OAuth pool: email----password----client_id----refresh_token
-    "hotmail_tokens_file": "./hotmail/alive_sample7.txt",
-    # Skip hotmail cards whose inbox already has xAI verification mail (burned).
+    # Optional personal Hotmail pool (not default). Format:
+    # email----password----client_id----refresh_token
+    "hotmail_tokens_file": "./hotmail/tokens.txt",
     "hotmail_skip_if_xai_mail": True,
 }
 

@@ -289,3 +289,56 @@ def clear_pin_for_direct(log: LogFn | None = None) -> None:
         if log:
             log("[*] 已清除线程代理钉扎（与浏览器直连对齐）")
         clear_runtime_proxy()
+
+
+def host_from_url_or_host(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "http://" + raw.split("/")[0]
+    try:
+        return (urlparse(raw).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def proxy_bypass_hosts_from_config(cfg: dict | None = None) -> set[str]:
+    """Hosts that should never use the residential proxy (mail, Tailscale, local)."""
+    cfg = cfg or {}
+    hosts: set[str] = set()
+    for key in ("cloudflare_api_base", "grok2api_remote_base"):
+        h = host_from_url_or_host(str(cfg.get(key) or ""))
+        if h:
+            hosts.add(h)
+    extra = str(cfg.get("proxy_bypass_hosts") or "").strip()
+    for part in extra.replace(";", ",").split(","):
+        item = part.strip().lower()
+        if not item:
+            continue
+        h = host_from_url_or_host(item) or item
+        if h:
+            hosts.add(h)
+    hosts.update({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+    return hosts
+
+
+def should_bypass_proxy_for_url(url: str, cfg: dict | None = None) -> bool:
+    """True for self-hosted mail, Tailscale MagicDNS (e.g. oe), private LAN, etc."""
+    host = host_from_url_or_host(url)
+    if not host:
+        return False
+    if host in proxy_bypass_hosts_from_config(cfg):
+        return True
+    # single-label host → often Tailscale MagicDNS (oe, azure, …)
+    if "." not in host:
+        return True
+    try:
+        import ipaddress
+
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return True
+    except ValueError:
+        pass
+    return False

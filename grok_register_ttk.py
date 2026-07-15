@@ -62,6 +62,9 @@ DEFAULT_CONFIG = {
     "proxy_file": "",
     # rotate | random | off  (off = ignore pool, only config.proxy)
     "proxy_pool_mode": "rotate",
+    # Comma-separated hosts forced direct (mail API / Tailscale / local).
+    # cloudflare_api_base and grok2api_remote_base hosts are always included.
+    "proxy_bypass_hosts": "sf4.yyjeqhc.cn,oe,localhost,127.0.0.1",
     "enable_nsfw": True,
     "register_count": 15,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -195,6 +198,31 @@ def get_proxies():
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def get_proxy_bypass_hosts():
+    try:
+        from proxy_pool import proxy_bypass_hosts_from_config
+
+        return proxy_bypass_hosts_from_config(config)
+    except Exception:
+        return {"localhost", "127.0.0.1"}
+
+
+def should_bypass_proxy_for_url(url):
+    try:
+        from proxy_pool import should_bypass_proxy_for_url as _bypass
+
+        return _bypass(url, config)
+    except Exception:
+        return False
+
+
+def get_proxies_for_url(url):
+    """Outbound proxies for an HTTP call; empty dict = direct (no proxy)."""
+    if should_bypass_proxy_for_url(url):
+        return {}
+    return get_proxies()
 
 
 def begin_account_proxy(log_callback=None, *, rotate=True):
@@ -547,7 +575,7 @@ def _pick_list_payload(data):
     return []
 
 
-def cloudflare_create_temp_address(api_base):
+def cloudflare_create_temp_address(api_base, log_callback=None):
     """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
     path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
     url = f"{api_base}{path}"
@@ -563,8 +591,17 @@ def cloudflare_create_temp_address(api_base):
         if domain:
             payload["domain"] = domain
         headers = {"Content-Type": "application/json"}
-    resp = http_post(url, json=payload, headers=headers)
-    resp.raise_for_status()
+    via = "直连" if should_bypass_proxy_for_url(url) else "代理"
+    if log_callback:
+        log_callback(f"[*] 创建临时邮箱 {via}: {url} domain={domain or '-'}")
+    try:
+        resp = http_post(url, json=payload, headers=headers)
+    except Exception as exc:
+        raise Exception(f"Cloudflare 创建邮箱请求失败 ({via}): {exc}") from exc
+    if resp.status_code >= 400:
+        raise Exception(
+            f"Cloudflare {path} HTTP {resp.status_code} ({via}): {resp.text[:300]}"
+        )
     try:
         data = resp.json()
     except Exception:
@@ -859,38 +896,50 @@ def create_browser_options(browser_proxy=""):
     return options
 
 
-def _build_request_kwargs(**kwargs):
+def _build_request_kwargs(url=None, **kwargs):
     request_kwargs = dict(kwargs)
     proxies = request_kwargs.pop("proxies", None)
     if proxies is None:
-        proxies = get_proxies()
+        proxies = get_proxies_for_url(url) if url else get_proxies()
+    # Explicit empty dict means "force direct"; omit key only when None was intended
+    # after pop — treat {} as direct (no proxy).
     if proxies:
         request_kwargs["proxies"] = proxies
+    else:
+        # Ensure requests does not inherit process-level HTTP(S)_PROXY env for
+        # bypass hosts (mail API / oe). Empty mapping disables trust_env proxies
+        # when we also set trust_env=False below.
+        request_kwargs["proxies"] = {"http": None, "https": None}
+        request_kwargs["trust_env"] = False
     request_kwargs.setdefault("timeout", 15)
     return request_kwargs
 
 
 def http_get(url, **kwargs):
-    request_kwargs = _build_request_kwargs(**kwargs)
+    request_kwargs = _build_request_kwargs(url=url, **kwargs)
     try:
         return requests.get(url, **request_kwargs)
     except Exception as exc:
-        if request_kwargs.get("proxies") and is_proxy_connection_error(exc):
+        if request_kwargs.get("proxies") and any(
+            request_kwargs["proxies"].get(k) for k in ("http", "https")
+        ) and is_proxy_connection_error(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
-            return requests.get(url, **_build_request_kwargs(**retry_kwargs))
+            return requests.get(url, **_build_request_kwargs(url=url, **retry_kwargs))
         raise
 
 
 def http_post(url, **kwargs):
-    request_kwargs = _build_request_kwargs(**kwargs)
+    request_kwargs = _build_request_kwargs(url=url, **kwargs)
     try:
         return requests.post(url, **request_kwargs)
     except Exception as exc:
-        if request_kwargs.get("proxies") and is_proxy_connection_error(exc):
+        if request_kwargs.get("proxies") and any(
+            request_kwargs["proxies"].get(k) for k in ("http", "https")
+        ) and is_proxy_connection_error(exc):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
-            return requests.post(url, **_build_request_kwargs(**retry_kwargs))
+            return requests.post(url, **_build_request_kwargs(url=url, **retry_kwargs))
         raise
 
 
@@ -1260,12 +1309,12 @@ def get_email_provider():
     return config.get("email_provider", "duckmail")
 
 
-def get_email_and_token(api_key=None):
+def get_email_and_token(api_key=None, log_callback=None):
     provider = get_email_provider()
     if provider == "hotmail":
         import hotmail_mail
 
-        return hotmail_mail.get_email_and_token(config=config, log_callback=None)
+        return hotmail_mail.get_email_and_token(config=config, log_callback=log_callback)
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -1273,9 +1322,11 @@ def get_email_and_token(api_key=None):
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
         try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
+            # cloudflare_temp_email 专用模式（默认直连，不走住宅代理）
+            return cloudflare_create_temp_address(api_base, log_callback=log_callback)
         except Exception as primary_exc:
+            if log_callback:
+                log_callback(f"[!] Cloudflare 主创建失败，尝试兜底: {primary_exc}")
             # 兜底回退到 Mail.tm 风格
             key = api_key or get_cloudflare_api_key()
             domains = cloudflare_get_domains(api_base, api_key=key)
@@ -2068,7 +2119,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
             config=config, log_callback=log_callback
         )
     else:
-        email, dev_token = get_email_and_token()
+        email, dev_token = get_email_and_token(log_callback=log_callback)
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:

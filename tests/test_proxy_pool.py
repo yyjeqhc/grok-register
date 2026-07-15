@@ -91,6 +91,33 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertNotIn("secret", lab)
         self.assertIn("user:***", lab)
 
+    def test_bypass_mail_and_tailscale(self):
+        cfg = {
+            "cloudflare_api_base": "https://sf4.yyjeqhc.cn/mail-api",
+            "grok2api_remote_base": "http://oe:8000/admin/api",
+            "proxy_bypass_hosts": "sf4.yyjeqhc.cn,oe,localhost",
+        }
+        self.assertTrue(
+            proxy_pool.should_bypass_proxy_for_url(
+                "https://sf4.yyjeqhc.cn/mail-api/api/new_address", cfg
+            )
+        )
+        self.assertTrue(
+            proxy_pool.should_bypass_proxy_for_url("http://oe:8000/admin/api/tokens", cfg)
+        )
+        self.assertTrue(
+            proxy_pool.should_bypass_proxy_for_url("http://127.0.0.1:8000/x", cfg)
+        )
+        # x.ai must still use residential proxy
+        self.assertFalse(
+            proxy_pool.should_bypass_proxy_for_url("https://accounts.x.ai/sign-up", cfg)
+        )
+        self.assertFalse(
+            proxy_pool.should_bypass_proxy_for_url(
+                "https://cli-chat-proxy.grok.com/v1/models", cfg
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@
   "proxy": "",
   "proxy_file": "./proxies/alive_proxies.txt",
   "proxy_pool_mode": "rotate",
+  "proxy_bypass_hosts": "sf4.yyjeqhc.cn,oe,localhost,127.0.0.1",
 
   "enable_nsfw": true,
   "register_count": 15,

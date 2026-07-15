@@ -44,6 +44,7 @@ grok-register (remote)
 | `proxy_file` | Optional proxy list (one `http://user:pass@ip:port` per line) |
 | `proxy_pool_mode` | `rotate` / `random` / `off` |
 | `proxy` | Static single proxy fallback when pool empty |
+| `proxy_bypass_hosts` | Hosts forced **direct** (mail API, Tailscale `oe`, localhost). Also auto-includes hosts of `cloudflare_api_base` / `grok2api_remote_base` |
 | `cpa_proxy` | Mint-only override; **leave empty** so SSO mint uses the same sticky proxy as browser |
 
 ### Sticky proxy (register + SSO mint)

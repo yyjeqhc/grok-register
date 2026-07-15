@@ -65,6 +65,12 @@ DEFAULT_CONFIG = {
     # Comma-separated hosts forced direct (mail API / Tailscale / local).
     # cloudflare_api_base and grok2api_remote_base hosts are always included.
     "proxy_bypass_hosts": "sf4.yyjeqhc.cn,oe,localhost,127.0.0.1",
+    # How many times to open signup via different proxies before last-resort direct.
+    "proxy_open_retries": 3,
+    # Fail fast when Chrome shows ERR_TUNNEL / 无法访问此网站 during set-cookie.
+    "proxy_tunnel_hard_timeout_sec": 20,
+    # Full register attempts per target slot when tunnel/UI stalls.
+    "register_slot_retries": 5,
     "enable_nsfw": True,
     "register_count": 15,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -109,6 +115,12 @@ class RegistrationCancelled(Exception):
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class ProxyTunnelError(AccountRetryNeeded):
+    """Browser proxy CONNECT/tunnel failed; caller must rotate proxy and retry."""
+
     pass
 
 
@@ -315,26 +327,105 @@ def is_proxy_connection_error(exc):
     return False
 
 
-def page_has_proxy_error(page_obj):
+_PROXY_TUNNEL_MARKERS = (
+    "err_tunnel_connection_failed",
+    "err_proxy_connection_failed",
+    "err_proxy_auth_unsupported",
+    "err_proxy_certificate_invalid",
+    "err_connection_reset",
+    "err_connection_closed",
+    "err_connection_timed_out",
+    "err_timed_out",
+    "err_empty_response",
+    "err_ssl_protocol_error",
+    "proxy connection failed",
+    "proxy server",
+    "proxy authentication",
+    "tunnel connection failed",
+    "无法连接到代理服务器",
+    "无法访问此网站",
+    "网页可能暂时无法连接",
+    "代理服务器",
+    "err_proxy",
+)
+
+
+def page_network_error_detail(page_obj):
+    """Return a short diagnostic string if the tab shows a Chrome net/proxy error."""
     try:
         url = str(getattr(page_obj, "url", "") or "")
         title = str(page_obj.run_js("return document.title || ''") or "")
-        body = str(page_obj.run_js("return document.body ? document.body.innerText.slice(0, 2000) : ''") or "")
-    except Exception:
-        return False
-    text = f"{url}\n{title}\n{body}".lower()
-    return any(
-        marker in text
-        for marker in (
-            "err_proxy",
-            "proxy connection failed",
-            "proxy server",
-            "proxy authentication",
-            "tunnel connection failed",
-            "无法连接到代理服务器",
-            "代理服务器",
+        body = str(
+            page_obj.run_js(
+                "return document.body ? document.body.innerText.slice(0, 2500) : ''"
+            )
+            or ""
         )
+    except Exception as exc:
+        return f"page-read-failed: {exc}"
+    text = f"{url}\n{title}\n{body}"
+    low = text.lower()
+    for marker in _PROXY_TUNNEL_MARKERS:
+        if marker in low:
+            # Prefer chrome-error URL or first line of body
+            snippet = body.replace("\n", " ").strip()[:160] or title or url
+            return f"{marker} | {snippet}"
+    # chrome error:// pages without our markers
+    if url.startswith("chrome-error://") or "chrome-error" in low:
+        return f"chrome-error | {(body or title or url)[:160]}"
+    return ""
+
+
+def page_has_proxy_error(page_obj):
+    return bool(page_network_error_detail(page_obj))
+
+
+def is_proxy_tunnel_message(text):
+    low = str(text or "").lower()
+    if not low:
+        return False
+    return any(m in low for m in _PROXY_TUNNEL_MARKERS) or "proxytunnel" in low.replace(
+        " ", ""
     )
+
+
+def rotate_proxy_and_restart_browser(log_callback=None, reason=""):
+    """Mark current pin dead, pick next pool proxy, restart Chromium on it."""
+    try:
+        from proxy_pool import mark_proxy_dead, proxy_log_label
+    except Exception:
+        mark_proxy_dead = None
+        proxy_log_label = lambda p: (p or "")[:40]
+
+    old = get_configured_proxy()
+    if old and mark_proxy_dead:
+        try:
+            mark_proxy_dead(old)
+        except Exception:
+            pass
+    if log_callback:
+        label = proxy_log_label(old) if old else "(none)"
+        log_callback(f"[!] 代理失败，换出口重开浏览器 old={label} reason={reason or '-'}")
+    begin_account_proxy(log_callback=log_callback, rotate=True)
+    return restart_browser(log_callback=log_callback, use_proxy=True)
+
+
+def append_partial_failure_record(email, password, reason, stage=""):
+    """Persist email/password when late-stage registration dies without sso."""
+    email = str(email or "").strip()
+    if not email:
+        return
+    path = os.path.join(os.path.dirname(__file__), "partial_failures.txt")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = (
+        f"{ts}\t{stage or '-'}\t{email}\t{password or ''}\t"
+        f"{str(reason or '').replace(chr(9), ' ')[:300]}\n"
+    )
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 class _ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
@@ -2095,27 +2186,46 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             page = browser.new_tab(SIGNUP_URL)
         page.wait.doc_loaded()
 
-    try:
-        _open_with_current_browser()
-    except Exception as e:
-        if browser_started_with_proxy and get_configured_proxy():
-            if log_callback:
-                log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {e}")
-            try:
-                from proxy_pool import clear_pin_for_direct, mark_proxy_dead
-
-                mark_proxy_dead(get_configured_proxy())
-                clear_pin_for_direct(log_callback)
-            except Exception:
-                pass
-            restart_browser(log_callback=log_callback, use_proxy=False)
+    max_proxy_switches = int(config.get("proxy_open_retries", 3) or 3)
+    last_err = None
+    for attempt in range(1, max_proxy_switches + 1):
+        raise_if_cancelled(cancel_callback)
+        try:
             _open_with_current_browser()
-        else:
-            raise
+            detail = page_network_error_detail(page) if page is not None else ""
+            if detail and browser_started_with_proxy and get_configured_proxy():
+                last_err = detail
+                if attempt >= max_proxy_switches:
+                    break
+                rotate_proxy_and_restart_browser(
+                    log_callback=log_callback,
+                    reason=f"open_signup attempt {attempt}/{max_proxy_switches}: {detail}",
+                )
+                continue
+            break
+        except Exception as e:
+            last_err = str(e)
+            if not (browser_started_with_proxy and get_configured_proxy()):
+                raise
+            if attempt >= max_proxy_switches:
+                break
+            if log_callback:
+                log_callback(
+                    f"[!] 打开注册页失败，换代理重试 ({attempt}/{max_proxy_switches}): {e}"
+                )
+            rotate_proxy_and_restart_browser(
+                log_callback=log_callback, reason=str(e)
+            )
+    else:
+        # loop exhausted without break — treat as failure below
+        pass
 
-    if browser_started_with_proxy and page_has_proxy_error(page):
+    # Last resort: direct (only if still broken and we had a proxy)
+    if page is not None and page_has_proxy_error(page) and get_configured_proxy():
         if log_callback:
-            log_callback("[!] 浏览器页面显示代理错误，自动回退直连")
+            log_callback(
+                f"[!] 代理池打开注册页仍失败，最后尝试直连: {page_network_error_detail(page) or last_err}"
+            )
         try:
             from proxy_pool import clear_pin_for_direct, mark_proxy_dead
 
@@ -2125,6 +2235,11 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             pass
         restart_browser(log_callback=log_callback, use_proxy=False)
         _open_with_current_browser()
+
+    if page is not None and page_has_proxy_error(page):
+        raise ProxyTunnelError(
+            f"无法打开注册页（代理/网络）: {page_network_error_detail(page) or last_err}"
+        )
 
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
@@ -2910,6 +3025,11 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     final_no_submit_since = None
     final_no_submit_timeout = 25
     login_hint_since = None
+    tunnel_error_since = None
+    tunnel_error_detail = ""
+    last_url = ""
+    # set-cookie / tunnel pages should fail fast and rotate proxy
+    tunnel_hard_timeout = float(config.get("proxy_tunnel_hard_timeout_sec", 20) or 20)
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2918,6 +3038,47 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
+
+            try:
+                last_url = str(getattr(page, "url", "") or "")
+            except Exception:
+                last_url = ""
+
+            # Chrome net error / ERR_TUNNEL during set-cookie chain
+            net_detail = page_network_error_detail(page)
+            if net_detail:
+                now_te = time.time()
+                if tunnel_error_since is None:
+                    tunnel_error_since = now_te
+                    tunnel_error_detail = net_detail
+                    if log_callback:
+                        log_callback(f"[!] 检测到浏览器网络/代理错误: {net_detail}")
+                # hard fail quickly on tunnel/proxy markers or chrome-error
+                low = net_detail.lower()
+                hard = any(
+                    m in low
+                    for m in (
+                        "err_tunnel",
+                        "err_proxy",
+                        "tunnel connection",
+                        "proxy connection",
+                        "无法访问此网站",
+                        "chrome-error",
+                    )
+                )
+                waited = now_te - tunnel_error_since
+                if hard or waited >= tunnel_hard_timeout:
+                    raise ProxyTunnelError(
+                        f"set-cookie/代理隧道失败 ({waited:.0f}s): {tunnel_error_detail or net_detail} url={last_url[:120]}"
+                    )
+            else:
+                tunnel_error_since = None
+                tunnel_error_detail = ""
+
+            # stuck on set-cookie URL without progressing (blank/slow tunnel)
+            if "set-cookie" in last_url.lower() or "auth.grok.com" in last_url.lower():
+                # if we sit here long with no sso cookie, treat as soft tunnel risk
+                pass
 
             # 邮箱已被占用时，页面常停在「您正在登录 / 返回」而不是完成注册
             try:
@@ -3066,16 +3227,35 @@ return String(cfInput.value || '').trim().length;
                         log_callback("[*] 已获取到 sso cookie")
                     return value
         except PageDisconnectedError:
-            refresh_active_page()
-        except (AccountRetryNeeded, EmailAlreadyRegistered, RegistrationCancelled):
+            if log_callback:
+                log_callback("[!] 浏览器标签断开，尝试刷新…")
+            try:
+                refresh_active_page()
+            except Exception:
+                raise ProxyTunnelError("浏览器页面断开且无法恢复，换代理重试")
+        except (AccountRetryNeeded, EmailAlreadyRegistered, RegistrationCancelled, ProxyTunnelError):
             raise
         except Exception:
             pass
 
         sleep_with_cancel(1, cancel_callback)
 
+    # Timeout: if we died on set-cookie / auth hop, force proxy rotate retry
+    url_l = (last_url or "").lower()
+    if (
+        "set-cookie" in url_l
+        or "auth.grok.com" in url_l
+        or "auth.x.ai" in url_l
+        or tunnel_error_detail
+        or is_proxy_tunnel_message(tunnel_error_detail)
+    ):
+        raise ProxyTunnelError(
+            f"等待 sso 超时且停在认证跳转/隧道错误: url={last_url[:160]} "
+            f"detail={tunnel_error_detail or '-'} cookies={sorted(last_seen_names)}"
+        )
     raise Exception(
-        f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
+        f"等待超时：未获取到 sso cookie。url={last_url[:120]} "
+        f"已看到 cookies: {sorted(last_seen_names)}"
     )
 
 
@@ -3402,17 +3582,14 @@ class GrokRegisterGUI:
                 self.log(f"[!] 代理池初始化失败: {exc}")
             i = 0
             retry_count_for_slot = 0
-            max_slot_retry = 3
+            max_slot_retry = int(config.get("register_slot_retries", 5) or 5)
             while i < count:
                 if self.should_stop():
                     break
                 self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                # Sticky proxy for this account: browser + SSO mint share it.
-                # Same-slot retries (retry_count_for_slot > 0) keep the pin.
-                begin_account_proxy(
-                    log_callback=self.log,
-                    rotate=(retry_count_for_slot == 0),
-                )
+                # Always rotate on each attempt so tunnel failures get a fresh exit.
+                # Sticky pin still holds for the whole attempt (browser + mint).
+                begin_account_proxy(log_callback=self.log, rotate=True)
                 try:
                     if browser is None:
                         start_browser(log_callback=self.log)
@@ -3421,8 +3598,9 @@ class GrokRegisterGUI:
                 except Exception:
                     start_browser(log_callback=self.log)
                 self.log("[*] 浏览器已按本账号代理启动")
+                email = ""
+                profile = {}
                 try:
-                    email = ""
                     dev_token = ""
                     code = ""
                     mail_ok = False
@@ -3545,10 +3723,51 @@ class GrokRegisterGUI:
                     retry_count_for_slot = 0
                     i += 1
                     self.log(f"[-] 邮箱已占用/已注册，换号: {exc}")
+                except ProxyTunnelError as exc:
+                    hotmail_mark_registration_result(
+                        email, success=False, log_callback=self.log
+                    )
+                    append_partial_failure_record(
+                        email,
+                        (profile or {}).get("password", ""),
+                        str(exc),
+                        stage="proxy_tunnel",
+                    )
+                    try:
+                        from proxy_pool import mark_proxy_dead
+
+                        mark_proxy_dead(get_configured_proxy())
+                    except Exception:
+                        pass
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        self.log(
+                            f"[!] 代理隧道失败，换出口重试 "
+                            f"{retry_count_for_slot}/{max_slot_retry}: {exc}"
+                        )
+                    else:
+                        self.fail_count += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        self.log(f"[-] 代理隧道重试耗尽，跳过: {exc}")
                 except AccountRetryNeeded as exc:
                     hotmail_mark_registration_result(
                         email, success=False, log_callback=self.log
                     )
+                    append_partial_failure_record(
+                        email,
+                        (profile or {}).get("password", ""),
+                        str(exc),
+                        stage="account_retry",
+                    )
+                    # Prefer new exit on UI/CF stalls too — same IP often stays stuck.
+                    try:
+                        from proxy_pool import mark_proxy_dead
+
+                        if is_proxy_tunnel_message(str(exc)):
+                            mark_proxy_dead(get_configured_proxy())
+                    except Exception:
+                        pass
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         self.log(
@@ -3565,16 +3784,41 @@ class GrokRegisterGUI:
                     hotmail_mark_registration_result(
                         email, success=False, log_callback=self.log
                     )
-                    self.fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[-] 注册失败: {exc}")
+                    append_partial_failure_record(
+                        email,
+                        (profile or {}).get("password", ""),
+                        str(exc),
+                        stage="error",
+                    )
+                    # Late-stage network wording → retry with new proxy instead of hard fail
+                    if is_proxy_tunnel_message(str(exc)) or "sso cookie" in str(exc).lower():
+                        try:
+                            from proxy_pool import mark_proxy_dead
+
+                            mark_proxy_dead(get_configured_proxy())
+                        except Exception:
+                            pass
+                        retry_count_for_slot += 1
+                        if retry_count_for_slot <= max_slot_retry:
+                            self.log(
+                                f"[!] 疑似网络/隧道问题，换出口重试 "
+                                f"{retry_count_for_slot}/{max_slot_retry}: {exc}"
+                            )
+                        else:
+                            self.fail_count += 1
+                            retry_count_for_slot = 0
+                            i += 1
+                            self.log(f"[-] 注册失败: {exc}")
+                    else:
+                        self.fail_count += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        self.log(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    # Next loop iteration re-pins (new account) or reuses pin (slot retry)
-                    # and restarts browser there — avoid an extra hop on the old pin.
+                    # Next loop iteration re-pins and restarts browser.
                     sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
@@ -3605,7 +3849,7 @@ def run_registration_cli(count):
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
-    max_slot_retry = 3
+    max_slot_retry = int(config.get("register_slot_retries", 5) or 5)
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
@@ -3634,10 +3878,8 @@ def run_registration_cli(count):
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            begin_account_proxy(
-                log_callback=cli_log,
-                rotate=(retry_count_for_slot == 0),
-            )
+            # Fresh exit every attempt (tunnel death must not reuse the dead pin).
+            begin_account_proxy(log_callback=cli_log, rotate=True)
             try:
                 if browser is None:
                     start_browser(log_callback=cli_log)
@@ -3646,8 +3888,9 @@ def run_registration_cli(count):
             except Exception:
                 start_browser(log_callback=cli_log)
             cli_log("[*] 浏览器已按本账号代理启动")
+            email = ""
+            profile = {}
             try:
-                email = ""
                 dev_token = ""
                 code = ""
                 mail_ok = False
@@ -3766,10 +4009,50 @@ def run_registration_cli(count):
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 邮箱已占用/已注册，换号: {exc}")
+            except ProxyTunnelError as exc:
+                hotmail_mark_registration_result(
+                    email, success=False, log_callback=cli_log
+                )
+                append_partial_failure_record(
+                    email,
+                    (profile or {}).get("password", ""),
+                    str(exc),
+                    stage="proxy_tunnel",
+                )
+                try:
+                    from proxy_pool import mark_proxy_dead
+
+                    mark_proxy_dead(get_configured_proxy())
+                except Exception:
+                    pass
+                retry_count_for_slot += 1
+                if retry_count_for_slot <= max_slot_retry:
+                    cli_log(
+                        f"[!] 代理隧道失败，换出口重试 "
+                        f"{retry_count_for_slot}/{max_slot_retry}: {exc}"
+                    )
+                else:
+                    fail_count += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(f"[-] 代理隧道重试耗尽，跳过: {exc}")
             except AccountRetryNeeded as exc:
                 hotmail_mark_registration_result(
                     email, success=False, log_callback=cli_log
                 )
+                append_partial_failure_record(
+                    email,
+                    (profile or {}).get("password", ""),
+                    str(exc),
+                    stage="account_retry",
+                )
+                try:
+                    from proxy_pool import mark_proxy_dead
+
+                    if is_proxy_tunnel_message(str(exc)):
+                        mark_proxy_dead(get_configured_proxy())
+                except Exception:
+                    pass
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -3784,14 +4067,38 @@ def run_registration_cli(count):
                 hotmail_mark_registration_result(
                     email, success=False, log_callback=cli_log
                 )
-                fail_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[-] 注册失败: {exc}")
+                append_partial_failure_record(
+                    email,
+                    (profile or {}).get("password", ""),
+                    str(exc),
+                    stage="error",
+                )
+                if is_proxy_tunnel_message(str(exc)) or "sso cookie" in str(exc).lower():
+                    try:
+                        from proxy_pool import mark_proxy_dead
+
+                        mark_proxy_dead(get_configured_proxy())
+                    except Exception:
+                        pass
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        cli_log(
+                            f"[!] 疑似网络/隧道问题，换出口重试 "
+                            f"{retry_count_for_slot}/{max_slot_retry}: {exc}"
+                        )
+                    else:
+                        fail_count += 1
+                        retry_count_for_slot = 0
+                        i += 1
+                        cli_log(f"[-] 注册失败: {exc}")
+                else:
+                    fail_count += 1
+                    retry_count_for_slot = 0
+                    i += 1
+                    cli_log(f"[-] 注册失败: {exc}")
             finally:
                 if controller.should_stop():
                     break
-                # Next iteration re-pins / restarts browser with the sticky proxy.
                 sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()

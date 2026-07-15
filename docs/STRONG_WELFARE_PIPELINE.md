@@ -41,6 +41,29 @@ grok-register (remote)
 | `cpa_device_fallback` | On SSO fail, try device browser mint |
 | `cpa_require_chat` | Overall `ok` only if chat probe passes |
 | `cpa_copy_to_hotload` | Copy to live only when chat OK (if require_chat) |
+| `proxy_file` | Optional proxy list (one `http://user:pass@ip:port` per line) |
+| `proxy_pool_mode` | `rotate` / `random` / `off` |
+| `proxy` | Static single proxy fallback when pool empty |
+| `cpa_proxy` | Mint-only override; **leave empty** so SSO mint uses the same sticky proxy as browser |
+
+### Sticky proxy (register + SSO mint)
+
+Each account picks one proxy from `proxy_file` and pins it on the worker thread for:
+
+1. Chromium signup  
+2. HTTP helpers (mail API via `get_proxies()`, NSFW, …)  
+3. SSO protocol CPA mint + chat probe  
+
+Probe first, then point `proxy_file` at the alive list:
+
+```bash
+python3 scripts/probe_proxies.py \
+  --file /path/to/all_proxies.txt \
+  --alive /path/to/alive_proxies.txt \
+  --dead /path/to/dead_proxies.txt \
+  --summary /path/to/proxy_probe_summary.json \
+  --site https://sf4.yyjeqhc.cn/mail-api/
+```
 
 ## Deploy remote
 

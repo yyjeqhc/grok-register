@@ -56,6 +56,12 @@ DEFAULT_CONFIG = {
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
+    # Optional proxy pool (one URL per line). When set, each account picks one
+    # proxy and keeps it sticky for browser signup + SSO/CPA mint + chat probe.
+    # Prefer a pre-probed alive list (see scripts/probe_proxies.py).
+    "proxy_file": "",
+    # rotate | random | off  (off = ignore pool, only config.proxy)
+    "proxy_pool_mode": "rotate",
     "enable_nsfw": True,
     "register_count": 15,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -175,7 +181,13 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_configured_proxy():
-    return str(config.get("proxy", "") or "").strip()
+    """Active proxy for browser + HTTP: thread pin (per-account) > config.proxy."""
+    try:
+        from proxy_pool import resolve_active_proxy
+
+        return resolve_active_proxy(config, for_mint=False)
+    except Exception:
+        return str(config.get("proxy", "") or "").strip()
 
 
 def get_proxies():
@@ -183,6 +195,20 @@ def get_proxies():
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def begin_account_proxy(log_callback=None, *, rotate=True):
+    """Pick+pin proxy for one account so browser and SSO mint share the exit IP."""
+    try:
+        from proxy_pool import acquire_proxy_for_account
+
+        return acquire_proxy_for_account(
+            config, log=log_callback, rotate=rotate
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 代理池选取失败，回退静态 proxy: {exc}")
+        return str(config.get("proxy", "") or "").strip()
 
 
 def _parse_proxy_url(proxy):
@@ -1983,6 +2009,13 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         if browser_started_with_proxy and get_configured_proxy():
             if log_callback:
                 log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {e}")
+            try:
+                from proxy_pool import clear_pin_for_direct, mark_proxy_dead
+
+                mark_proxy_dead(get_configured_proxy())
+                clear_pin_for_direct(log_callback)
+            except Exception:
+                pass
             restart_browser(log_callback=log_callback, use_proxy=False)
             _open_with_current_browser()
         else:
@@ -1991,6 +2024,13 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     if browser_started_with_proxy and page_has_proxy_error(page):
         if log_callback:
             log_callback("[!] 浏览器页面显示代理错误，自动回退直连")
+        try:
+            from proxy_pool import clear_pin_for_direct, mark_proxy_dead
+
+            mark_proxy_dead(get_configured_proxy())
+            clear_pin_for_direct(log_callback)
+        except Exception:
+            pass
         restart_browser(log_callback=log_callback, use_proxy=False)
         _open_with_current_browser()
 
@@ -3252,8 +3292,22 @@ class GrokRegisterGUI:
 
     def run_registration(self, count):
         try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
+            try:
+                from proxy_pool import configure_pool_from_config, pool_size
+
+                n_pool = configure_pool_from_config(config)
+                if n_pool:
+                    self.log(
+                        f"[*] 代理池已加载: {n_pool} 条 "
+                        f"(mode={config.get('proxy_pool_mode') or 'rotate'} "
+                        f"file={config.get('proxy_file') or '-'})"
+                    )
+                elif config.get("proxy"):
+                    self.log(f"[*] 静态代理: {config.get('proxy')}")
+                else:
+                    self.log("[*] 未配置代理（直连）")
+            except Exception as exc:
+                self.log(f"[!] 代理池初始化失败: {exc}")
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
@@ -3261,6 +3315,20 @@ class GrokRegisterGUI:
                 if self.should_stop():
                     break
                 self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                # Sticky proxy for this account: browser + SSO mint share it.
+                # Same-slot retries (retry_count_for_slot > 0) keep the pin.
+                begin_account_proxy(
+                    log_callback=self.log,
+                    rotate=(retry_count_for_slot == 0),
+                )
+                try:
+                    if browser is None:
+                        start_browser(log_callback=self.log)
+                    else:
+                        restart_browser(log_callback=self.log)
+                except Exception:
+                    start_browser(log_callback=self.log)
+                self.log("[*] 浏览器已按本账号代理启动")
                 try:
                     email = ""
                     dev_token = ""
@@ -3413,10 +3481,8 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    if browser is None:
-                        start_browser(log_callback=self.log)
-                    else:
-                        restart_browser(log_callback=self.log)
+                    # Next loop iteration re-pins (new account) or reuses pin (slot retry)
+                    # and restarts browser there — avoid an extra hop on the old pin.
                     sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
@@ -3455,13 +3521,39 @@ def run_registration_cli(count):
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
+        try:
+            from proxy_pool import configure_pool_from_config
+
+            n_pool = configure_pool_from_config(config)
+            if n_pool:
+                cli_log(
+                    f"[*] 代理池已加载: {n_pool} 条 "
+                    f"(mode={config.get('proxy_pool_mode') or 'rotate'} "
+                    f"file={config.get('proxy_file') or '-'})"
+                )
+            elif config.get("proxy"):
+                cli_log(f"[*] 静态代理: {config.get('proxy')}")
+            else:
+                cli_log("[*] 未配置代理（直连）")
+        except Exception as exc:
+            cli_log(f"[!] 代理池初始化失败: {exc}")
         i = 0
         while i < count:
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            begin_account_proxy(
+                log_callback=cli_log,
+                rotate=(retry_count_for_slot == 0),
+            )
+            try:
+                if browser is None:
+                    start_browser(log_callback=cli_log)
+                else:
+                    restart_browser(log_callback=cli_log)
+            except Exception:
+                start_browser(log_callback=cli_log)
+            cli_log("[*] 浏览器已按本账号代理启动")
             try:
                 email = ""
                 dev_token = ""
@@ -3607,10 +3699,7 @@ def run_registration_cli(count):
             finally:
                 if controller.should_stop():
                     break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
+                # Next iteration re-pins / restarts browser with the sticky proxy.
                 sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()

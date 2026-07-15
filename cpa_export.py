@@ -89,6 +89,16 @@ def export_cookies_from_page(page: Any) -> list[dict]:
 
 
 def _resolve_proxy(cfg: dict) -> str:
+    """Same sticky proxy as browser register when cpa_proxy is empty.
+
+    Priority (via proxy_pool): cpa_proxy override → thread pin → proxy → env.
+    """
+    try:
+        from proxy_pool import resolve_active_proxy
+
+        return resolve_active_proxy(cfg, for_mint=True)
+    except Exception:
+        pass
     proxy = (cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip()
     if proxy:
         return proxy

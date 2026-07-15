@@ -28,3 +28,7 @@ autoPortData/
 # hotmail OAuth pools (secrets)
 hotmail/*.txt
 !hotmail/README.txt
+
+# proxy pool credentials (keep local)
+proxies/*.txt
+!proxies/README.md

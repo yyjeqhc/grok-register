@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -897,50 +897,87 @@ def create_browser_options(browser_proxy=""):
 
 
 def _build_request_kwargs(url=None, **kwargs):
+    """Build kwargs for curl_cffi.requests (no trust_env — not supported)."""
     request_kwargs = dict(kwargs)
     proxies = request_kwargs.pop("proxies", None)
     if proxies is None:
         proxies = get_proxies_for_url(url) if url else get_proxies()
-    # Explicit empty dict means "force direct"; omit key only when None was intended
-    # after pop — treat {} as direct (no proxy).
+    # curl_cffi: omit proxies or pass real proxy URL. Empty/None mapping can
+    # break some versions; use no "proxies" key for direct, and clear env
+    # inheritance via a short-lived Session when needed (see _http_call).
     if proxies:
         request_kwargs["proxies"] = proxies
+        request_kwargs["_force_direct"] = False
     else:
-        # Ensure requests does not inherit process-level HTTP(S)_PROXY env for
-        # bypass hosts (mail API / oe). Empty mapping disables trust_env proxies
-        # when we also set trust_env=False below.
-        request_kwargs["proxies"] = {"http": None, "https": None}
-        request_kwargs["trust_env"] = False
+        request_kwargs.pop("proxies", None)
+        request_kwargs["_force_direct"] = True
     request_kwargs.setdefault("timeout", 15)
     return request_kwargs
 
 
-def http_get(url, **kwargs):
+def _proxy_dict_is_active(proxies):
+    if not proxies or not isinstance(proxies, dict):
+        return False
+    return any(proxies.get(k) for k in ("http", "https", "all"))
+
+
+def _http_call(method, url, **kwargs):
+    """GET/POST via curl_cffi; force-direct bypasses env HTTP(S)_PROXY."""
     request_kwargs = _build_request_kwargs(url=url, **kwargs)
+    force_direct = bool(request_kwargs.pop("_force_direct", False))
+    do = getattr(requests, method)
     try:
-        return requests.get(url, **request_kwargs)
+        if force_direct:
+            # Prefer Session so we can disable env proxy pickup when supported.
+            session = None
+            try:
+                session = requests.Session()
+                if hasattr(session, "trust_env"):
+                    session.trust_env = False
+                # Also blank process env for this call only if Session lacks trust_env.
+                old_env = {}
+                env_keys = (
+                    "http_proxy",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                    "all_proxy",
+                )
+                if not hasattr(session, "trust_env"):
+                    for k in env_keys:
+                        if k in os.environ:
+                            old_env[k] = os.environ.pop(k)
+                try:
+                    return session.request(method.upper(), url, **request_kwargs)
+                finally:
+                    for k, v in old_env.items():
+                        os.environ[k] = v
+            finally:
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+        return do(url, **request_kwargs)
     except Exception as exc:
-        if request_kwargs.get("proxies") and any(
-            request_kwargs["proxies"].get(k) for k in ("http", "https")
-        ) and is_proxy_connection_error(exc):
+        if (
+            (not force_direct)
+            and _proxy_dict_is_active(request_kwargs.get("proxies"))
+            and is_proxy_connection_error(exc)
+        ):
             retry_kwargs = dict(kwargs)
             retry_kwargs["proxies"] = {}
-            return requests.get(url, **_build_request_kwargs(url=url, **retry_kwargs))
+            return _http_call(method, url, **retry_kwargs)
         raise
+
+
+def http_get(url, **kwargs):
+    return _http_call("get", url, **kwargs)
 
 
 def http_post(url, **kwargs):
-    request_kwargs = _build_request_kwargs(url=url, **kwargs)
-    try:
-        return requests.post(url, **request_kwargs)
-    except Exception as exc:
-        if request_kwargs.get("proxies") and any(
-            request_kwargs["proxies"].get(k) for k in ("http", "https")
-        ) and is_proxy_connection_error(exc):
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["proxies"] = {}
-            return requests.post(url, **_build_request_kwargs(url=url, **retry_kwargs))
-        raise
+    return _http_call("post", url, **kwargs)
 
 
 def raise_if_cancelled(cancel_callback=None):
@@ -1930,8 +1967,12 @@ def stop_browser():
     if browser is not None:
         try:
             browser.quit(del_data=True)
-        except Exception:
-            pass
+        except (Exception, KeyboardInterrupt):
+            # Ctrl+C during rmtree of temp profile is common on Windows; ignore.
+            try:
+                browser.quit(del_data=False)
+            except Exception:
+                pass
     stop_browser_proxy_bridge()
     browser = None
     page = None
